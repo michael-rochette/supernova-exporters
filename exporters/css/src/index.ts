@@ -1,10 +1,24 @@
-import { Supernova, PulsarContext, RemoteVersionIdentifier, AnyOutputFile, TokenType } from "@supernovaio/sdk-exporters"
+import { Supernova, PulsarContext, RemoteVersionIdentifier, AnyOutputFile, TokenType, Token, Brand, TokenGroup } from "@supernovaio/sdk-exporters"
 import { ExporterConfiguration } from "../config"
 import { indexOutputFile } from "./files/index-file"
 import { styleOutputFile } from "./files/style-file"
+import { FileHelper } from "@supernovaio/export-helpers"
 
 /** Exporter configuration. Adheres to the `ExporterConfiguration` interface and its content comes from the resolved default configuration + user overrides of various configuration keys */
 export const exportConfiguration = Pulsar.exportConfig<ExporterConfiguration>()
+
+
+type StructuredTokens = Record<string, {
+  name: {
+    brand: string,
+    brandMode: string,
+    category: string,
+    rawName: string,
+    type: string
+  },
+  values: Record<string, string>,
+  usage: string
+}>
 
 /**
  * Export entrypoint.
@@ -19,40 +33,88 @@ Pulsar.export(async (sdk: Supernova, context: PulsarContext): Promise<Array<AnyO
   }
 
   // Fetch the necessary data
-  let tokens = await sdk.tokens.getTokens(remoteVersionIdentifier)
+  let tokens = (await sdk.tokens.getTokens(remoteVersionIdentifier)).sort((a,b) => a.parentGroupId < b.parentGroupId ? -1 : 1)
   let tokenGroups = await sdk.tokens.getTokenGroups(remoteVersionIdentifier)
+  const brands:Brand[] = await sdk.brands.getBrands(remoteVersionIdentifier)
 
-  // Filter by brand, if specified
-  if (context.brandId) {
-    const brands = await sdk.brands.getBrands(remoteVersionIdentifier)
-    const brand = brands.find((brand) => brand.id === context.brandId || brand.idInVersion === context.brandId)
-    if (!brand) {
-      throw new Error(`Unable to find brand ${context.brandId}.`)
-    }
+  const structuredTokens: StructuredTokens = getStructuredTokens(tokenGroups, tokens, brands)
 
-    tokens = tokens.filter((token) => token.brandId === brand.id)
-    tokenGroups = tokenGroups.filter((tokenGroup) => tokenGroup.brandId === brand.id)
-  }
+  const content = formatForContent(structuredTokens)
 
-  // Apply theme, if specified
-  if (context.themeId) {
-    const themes = await sdk.tokens.getTokenThemes(remoteVersionIdentifier)
-    const theme = themes.find((theme) => theme.id === context.themeId || theme.idInVersion === context.themeId)
-    if (theme) {
-      tokens = await sdk.tokens.computeTokensByApplyingThemes(tokens, [theme])
-    } else {
-      // Don't allow applying theme which doesn't exist in the system
-      throw new Error("Unable to apply theme which doesn't exist in the system.")
-    }
-  }
 
-  // Generate output files
-  return [
-    // One file per token type
-    ...(Object.values(TokenType)
-      .map((type) => styleOutputFile(type, tokens, tokenGroups))
-      .filter((f) => f !== null) as Array<AnyOutputFile>),
-    // One file that imports all other files, if enabled
-    indexOutputFile(tokens),
+  
+
+  return [FileHelper.createTextFile({
+    relativePath: './',
+    fileName: 'test.md',
+    content
+  })
   ]
 })
+
+
+function getStructuredTokens (tokenGroups: TokenGroup[], tokens: Token[], brands: Brand[]) {
+  const result = {}
+
+  tokens.forEach(token => {
+    const group = getGroupById(tokenGroups, token.parentGroupId)
+    if (!group) {
+      return
+    }
+
+    const {tokenGroup, name} = getRootGroupAndName(tokenGroups, group, token.name)
+
+    const rootGroupName = tokenGroup.name
+
+    if (!result[rootGroupName]) {
+      result[rootGroupName] = []
+    }
+
+    const [category,] = name.split("__")
+
+    result[rootGroupName].push({
+      name: {
+        brand: getBrandNameById(brands, token.brandId),
+        brandMode: "default",
+        category,
+        platform: token.propertyValues.platform || '',
+        rawName: token.propertyValues.variable,
+        type: rootGroupName
+      },
+      values: token.propertyValues,
+      usage: token.description
+    })
+  })
+
+  return result
+  
+}
+
+function getRootGroupAndName(tokenGroups: TokenGroup[], tokenGroup: TokenGroup, name: string) {
+  const parentGroup = tokenGroup?.parentGroupId && getGroupById(tokenGroups, tokenGroup.parentGroupId)
+
+  if (parentGroup && parentGroup.id !== tokenGroup.id) {
+    name = `${parentGroup.name}__${name}`
+
+    const result = getRootGroupAndName(tokenGroups, parentGroup, name)
+
+    tokenGroup = result.tokenGroup
+  }
+
+  return {
+    tokenGroup,
+    name
+  }
+}
+
+function getGroupById (tokenGroups: TokenGroup[], groupId:string) {
+  return tokenGroups.find(({id}) => groupId === id)
+}
+
+function formatForContent (structuredTokens: StructuredTokens) {
+  return JSON.stringify(structuredTokens)
+}
+
+function getBrandNameById(brands: Brand[], brandId: string) {
+  return brands.find(({id}) => brandId === id)?.name
+}
